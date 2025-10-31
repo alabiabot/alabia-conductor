@@ -1,0 +1,79 @@
+version: '3.8'
+
+services:
+  # Orchestrator - FastAPI + MCP
+  orchestrator:
+    build:
+      context: ..
+      dockerfile: infra/Dockerfile
+    container_name: alabia-conductor
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - ../.env
+    volumes:
+      # Code (para development)
+      - ../apps:/app/apps
+      - ../packages:/app/packages
+      # Data persistence
+      - ../data:/app/data
+      - ../secrets:/app/secrets
+      # Logs
+      - ./logs:/app/logs
+    depends_on:
+      - chroma
+    networks:
+      - alabia-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # ChromaDB - Vector Store
+  chroma:
+    image: chromadb/chroma:latest
+    container_name: alabia-chroma
+    restart: unless-stopped
+    ports:
+      - "8001:8000"
+    volumes:
+      - chroma-data:/chroma/chroma
+    environment:
+      - IS_PERSISTENT=TRUE
+      - ANONYMIZED_TELEMETRY=FALSE
+    networks:
+      - alabia-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/heartbeat"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Nginx - Reverse Proxy (Opcional)
+  nginx:
+    image: nginx:alpine
+    container_name: alabia-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - orchestrator
+    networks:
+      - alabia-network
+    profiles:
+      - production
+
+networks:
+  alabia-network:
+    driver: bridge
+
+volumes:
+  chroma-data:
+    driver: local
