@@ -9,6 +9,10 @@ from pathlib import Path
 from typing import List, Dict
 import chromadb
 from chromadb.config import Settings
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # OpenAI para embeddings
 from openai import OpenAI

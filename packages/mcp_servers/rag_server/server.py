@@ -8,6 +8,10 @@ import logging
 import os
 from typing import List
 import json
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 # MCP imports
 try:

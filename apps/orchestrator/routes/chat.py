@@ -7,6 +7,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from packages.llm.anthropic_driver import AnthropicDriver
+from packages.llm.prompts import ALABIA_SYSTEM_PROMPT
 from apps.orchestrator.mcp_client import mcp_orchestrator
 
 logger = logging.getLogger(__name__)
@@ -89,15 +90,21 @@ async def chat(request: ChatRequest) -> ChatResponse:
         # 3. Build system prompt
         system_prompt = _build_system_prompt(request.context)
 
-        # 4. Process with Claude + MCP loop
+        # 4. Build conversation history from context
+        conversation_history = []
+        if request.context and request.context.previous_messages:
+            conversation_history = _build_conversation_history(request.context.previous_messages)
+
+        # 5. Process with Claude + MCP loop
         result = await anthropic_driver.chat_with_tools(
             user_message=request.message,
             system=system_prompt,
             tools=anthropic_tools,
-            tool_executor=mcp_orchestrator.execute_tool
+            tool_executor=mcp_orchestrator.execute_tool,
+            conversation_history=conversation_history
         )
 
-        # 5. Format response
+        # 6. Format response
         return ChatResponse(
             response=result["response"],
             actions=[
@@ -119,45 +126,66 @@ async def chat(request: ChatRequest) -> ChatResponse:
         )
 
 
+def _build_conversation_history(previous_messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """
+    Converte previous_messages para formato Anthropic
+
+    Expected format:
+    [
+        {"role": "user", "content": "..."},
+        {"role": "assistant", "content": "..."},
+        ...
+    ]
+    """
+    history = []
+    for msg in previous_messages:
+        role = msg.get("role", "user")
+        content = msg.get("content", msg.get("text", ""))
+
+        if role and content:
+            history.append({"role": role, "content": content})
+
+    return history
+
+
 def _build_system_prompt(context: Optional[ChatContext]) -> str:
     """Constrói system prompt para Claude"""
+    from datetime import datetime, timezone, timedelta
 
-    base_prompt = """Você é o assistente inteligente da Alabia, uma plataforma de atendimento com IA.
+    # Usa o prompt otimizado do arquivo prompts.py
+    base_prompt = ALABIA_SYSTEM_PROMPT
 
-Seu papel é ajudar clientes via WhatsApp com:
-- Informações sobre planos e preços
-- Agendamento de reuniões comerciais
-- Dúvidas sobre serviços e funcionalidades
-- Suporte técnico básico
+    # Adiciona data/hora atual (timezone Brasil = UTC-3)
+    tz_br = timezone(timedelta(hours=-3))
+    now = datetime.now(tz_br)
 
-Você tem acesso às seguintes ferramentas:
-- file_search: Busca em documentação interna (preços, FAQ, etc)
-- create_event: Cria eventos no Google Calendar
-- check_availability: Verifica horários disponíveis
-- web_search: Busca informações na internet (use apenas se necessário)
+    base_prompt += f"\n\n## 📅 CONTEXTO TEMPORAL\n"
+    base_prompt += f"- **Data/Hora Atual:** {now.strftime('%Y-%m-%d %H:%M')} (Brasil)\n"
+    base_prompt += f"- **Dia da Semana:** {now.strftime('%A')}\n"
+    base_prompt += f"- **É fim de semana:** {'Sim' if now.weekday() >= 5 else 'Não'}\n"
+    base_prompt += f"\n**Use esta informação para calcular 'hoje', 'amanhã', etc.**\n"
 
-Diretrizes:
-- Seja cordial, profissional e prestativo
-- Use linguagem natural e amigável
-- Quando agendar reuniões, sempre confirme com o cliente antes de criar
-- Para dúvidas sobre preços/funcionalidades, use file_search primeiro
-- Sempre pergunte o email do cliente antes de agendar reunião
-- Seja conciso nas respostas (WhatsApp)
-
-Tom de voz: Profissional mas descontraído, típico brasileiro"""
+    # Se for fora do horário comercial, avise
+    if now.hour < 8 or now.hour >= 18 or now.weekday() >= 5:
+        base_prompt += f"\n⚠️ **IMPORTANTE:** Estamos fora do horário comercial (Seg-Sex 8h-18h).\n"
+        base_prompt += f"Ofereça agendar para próximo dia útil.\n"
 
     # Adiciona contexto do usuário se disponível
     if context:
         user_info = []
         if context.name:
-            user_info.append(f"Nome: {context.name}")
+            user_info.append(f"**Nome: {context.name}**")
         if context.email:
-            user_info.append(f"Email: {context.email}")
+            user_info.append(f"**Email: {context.email}** ← USE ESTE EMAIL quando o cliente disser 'o mesmo'")
         if context.phone:
-            user_info.append(f"Telefone: {context.phone}")
+            user_info.append(f"**Telefone/WhatsApp: {context.phone}** ← USE no person_phone do create_lead")
 
         if user_info:
-            base_prompt += f"\n\nInformações do cliente:\n" + "\n".join(user_info)
+            base_prompt += f"\n\n## 👤 INFORMAÇÕES DO CLIENTE\n" + "\n".join(f"- {info}" for info in user_info)
+            base_prompt += "\n\n**⚠️ IMPORTANTE:**"
+            base_prompt += "\n- Quando o cliente disser 'o mesmo email', use o email acima"
+            base_prompt += "\n- SEMPRE use o telefone acima no campo person_phone do create_lead"
+            base_prompt += "\n- NUNCA use telefone como email!"
 
     return base_prompt
 

@@ -66,10 +66,18 @@ class CalendarClient:
             if self.creds and self.creds.expired and self.creds.refresh_token:
                 self.creds.refresh(Request())
             else:
+                # Tenta usar run_local_server, mas se falhar (WSL), usa run_console
                 flow = InstalledAppFlow.from_client_secrets_file(
                     self.credentials_path, SCOPES
                 )
-                self.creds = flow.run_local_server(port=0)
+                try:
+                    # Tenta abrir navegador (funciona no Windows/Mac/Linux com GUI)
+                    self.creds = flow.run_local_server(port=0, open_browser=False)
+                except Exception as e:
+                    logger.warning(f"run_local_server failed (WSL?): {e}")
+                    logger.info("Switching to console flow...")
+                    # Fallback para console flow (mostra URL para copiar)
+                    self.creds = flow.run_console()
 
             # Salva token para próximas execuções
             with open(token_path, 'w') as token:
@@ -117,19 +125,37 @@ class CalendarClient:
                     'dateTime': end.isoformat(),
                     'timeZone': 'America/Sao_Paulo',
                 },
+                # Adiciona Google Meet automaticamente
+                'conferenceData': {
+                    'createRequest': {
+                        'requestId': f"alabia-{start.timestamp()}",
+                        'conferenceSolutionKey': {'type': 'hangoutsMeet'}
+                    }
+                }
             }
 
             if attendee_email:
                 event['attendees'] = [{'email': attendee_email}]
                 event['sendUpdates'] = 'all'  # Envia email para participantes
 
-            # Cria evento
+            # Cria evento com Google Meet
+            # conferenceDataVersion=1 é necessário para criar Meet
             created_event = self.service.events().insert(
                 calendarId=calendar_id,
-                body=event
+                body=event,
+                conferenceDataVersion=1  # ✅ Necessário para Google Meet
             ).execute()
 
             logger.info(f"Event created: {created_event.get('id')}")
+
+            # Extrai link do Google Meet
+            meet_link = None
+            if 'conferenceData' in created_event:
+                entry_points = created_event['conferenceData'].get('entryPoints', [])
+                for entry in entry_points:
+                    if entry.get('entryPointType') == 'video':
+                        meet_link = entry.get('uri')
+                        break
 
             return {
                 "event_id": created_event.get('id'),
@@ -137,7 +163,9 @@ class CalendarClient:
                 "start": created_event['start'].get('dateTime'),
                 "end": created_event['end'].get('dateTime'),
                 "status": created_event.get('status'),
-                "calendar_link": created_event.get('htmlLink')
+                "calendar_link": created_event.get('htmlLink'),
+                "meet_link": meet_link,  # ✅ Link do Google Meet
+                "attendee_email": attendee_email
             }
 
         except HttpError as error:
@@ -251,6 +279,43 @@ class CalendarClient:
             logger.error(f"Error listing events: {error}")
             raise Exception(f"Failed to list events: {error}")
 
+    def cancel_event(
+        self,
+        event_id: str,
+        calendar_id: str = 'primary',
+        send_updates: bool = True
+    ) -> Dict[str, Any]:
+        """
+        Cancela/deleta um evento do calendário
+
+        Args:
+            event_id: ID do evento a ser cancelado
+            calendar_id: ID do calendário
+            send_updates: Se True, notifica participantes do cancelamento
+
+        Returns:
+            Confirmação do cancelamento
+        """
+        try:
+            # Opção 1: Deletar completamente o evento
+            self.service.events().delete(
+                calendarId=calendar_id,
+                eventId=event_id,
+                sendUpdates='all' if send_updates else 'none'
+            ).execute()
+
+            logger.info(f"Event deleted: {event_id}")
+
+            return {
+                "event_id": event_id,
+                "status": "cancelled",
+                "message": "Evento cancelado com sucesso"
+            }
+
+        except HttpError as error:
+            logger.error(f"Error cancelling event: {error}")
+            raise Exception(f"Failed to cancel event: {error}")
+
 
 # Cliente global
 calendar_client = None
@@ -325,6 +390,24 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": []
             }
+        ),
+        Tool(
+            name="cancel_event",
+            description="Cancela/deleta um evento do calendário. Use quando o cliente quiser reagendar ou cancelar uma reunião.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "event_id": {
+                        "type": "string",
+                        "description": "ID do evento a ser cancelado (obtido via list_events)"
+                    },
+                    "send_updates": {
+                        "type": "boolean",
+                        "description": "Se True, notifica participantes do cancelamento (padrão: True)"
+                    }
+                },
+                "required": ["event_id"]
+            }
         )
     ]
 
@@ -332,10 +415,12 @@ async def list_tools() -> list[Tool]:
 @server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     """Executa tool"""
+    import json
     global calendar_client
 
     if not calendar_client:
-        return [TextContent(type="text", text="ERROR: Calendar client not initialized")]
+        error_result = {"error": "Calendar client not initialized", "tool": name}
+        return [TextContent(type="text", text=json.dumps(error_result, ensure_ascii=False))]
 
     try:
         if name == "create_event":
@@ -344,15 +429,23 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             result = calendar_client.check_availability(**arguments)
         elif name == "list_events":
             result = calendar_client.list_events(**arguments)
+        elif name == "cancel_event":
+            result = calendar_client.cancel_event(**arguments)
         else:
-            return [TextContent(type="text", text=f"ERROR: Unknown tool: {name}")]
+            error_result = {"error": f"Unknown tool: {name}", "tool": name}
+            return [TextContent(type="text", text=json.dumps(error_result, ensure_ascii=False))]
 
-        import json
         return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False, indent=2))]
 
     except Exception as e:
         logger.error(f"Error executing {name}: {e}", exc_info=True)
-        return [TextContent(type="text", text=f"ERROR: {str(e)}")]
+        # Return error as JSON
+        error_result = {
+            "error": str(e),
+            "tool": name,
+            "arguments": arguments
+        }
+        return [TextContent(type="text", text=json.dumps(error_result, ensure_ascii=False))]
 
 
 async def main():
